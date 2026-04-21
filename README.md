@@ -38,13 +38,18 @@ Open the dashboard URL and confirm `apiservice` and `webfrontend` are **Running*
 
 ## Step 1 – Add PostgreSQL to AppHost
 
+Add the AppHost integration package first:
+```bash
+cd WeatherApp.AppHost
+dotnet add package Aspire.Hosting.PostgreSQL
+```
+
 Open `WeatherApp.AppHost/AppHost.cs` and update it to:
 
 ```csharp
 var builder = DistributedApplication.CreateBuilder(args);
 
 var postgres = builder.AddPostgres("postgres")
-                      .WithPgAdmin()
                       .AddDatabase("weatherdb");
 
 var apiService = builder.AddProject<Projects.WeatherApp_ApiService>("apiservice")
@@ -63,7 +68,7 @@ builder.Build().Run();
 
 Add packages to `WeatherApp.ApiService`:
 ```bash
-cd WeatherApp.ApiService
+cd ../WeatherApp.ApiService
 dotnet add package Aspire.Npgsql
 dotnet add package Dapper
 ```
@@ -100,27 +105,36 @@ await using (var conn = await app.Services
 }
 ```
 
-Add the using at the top of `Program.cs`:
+Add the usings at the top of `WeatherApp.ApiService/Program.cs`:
 ```csharp
 using Dapper;
+using Npgsql;
 ```
 
 ### 2c. Update the `/weatherforecast` endpoint to save records
 
+> Dapper does not bind `DateOnly` parameters by default, so convert `DateOnly` to `DateTime` for SQL inserts.
+
 ```csharp
 app.MapGet("/weatherforecast", async (NpgsqlDataSource db) =>
 {
-    var forecast = Enumerable.Range(1, 5).Select(index => new
-    {
-        Date = DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-        TempC = Random.Shared.Next(-20, 55),
-        Summary = summaries[Random.Shared.Next(summaries.Length)]
-    }).ToList();
+    var forecast = Enumerable.Range(1, 5).Select(index =>
+        new WeatherForecast(
+            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
+            Random.Shared.Next(-20, 55),
+            summaries[Random.Shared.Next(summaries.Length)]
+        ))
+        .ToList();
 
     await using var conn = await db.OpenConnectionAsync();
     await conn.ExecuteAsync(
         "INSERT INTO weather_records (date, temp_c, summary) VALUES (@Date, @TempC, @Summary)",
-        forecast);
+        forecast.Select(f => new
+        {
+            Date = f.Date.ToDateTime(TimeOnly.MinValue),
+            TempC = f.TemperatureC,
+            f.Summary
+        }));
 
     return forecast;
 }).WithName("GetWeatherForecast");
@@ -132,7 +146,7 @@ app.MapGet("/weatherforecast", async (NpgsqlDataSource db) =>
 aspire run
 ```
 
-Dashboard → **Resources** → click the **pgAdmin** link → open the `weatherdb` database → confirm the `weather_records` table is being populated.
+Dashboard → **Resources** → confirm `postgres` and `weatherdb` are running, then load the weather page (or call `/weatherforecast`) a few times to confirm records are being saved.
 
 ---
 
@@ -143,14 +157,15 @@ Dashboard → **Resources** → click the **pgAdmin** link → open the `weather
 Add the package to `WeatherApp.AppHost`:
 ```bash
 cd ../WeatherApp.AppHost
-dotnet add package Aspire.Hosting.Ollama
+dotnet add package CommunityToolkit.Aspire.Hosting.Ollama --prerelease
 ```
 
 Update `AppHost.cs`:
 ```csharp
 var ollama = builder.AddOllama("ollama")
-                    .AddModel("llama3.2")
                     .WithDataVolume(); // model weights persist between runs
+
+ollama.AddModel("llama3.2"); // download the model on first run
 
 var apiService = builder.AddProject<Projects.WeatherApp_ApiService>("apiservice")
     .WithReference(postgres)
@@ -160,40 +175,63 @@ var apiService = builder.AddProject<Projects.WeatherApp_ApiService>("apiservice"
     .WithHttpHealthCheck("/health");
 ```
 
+> **Why split the variable?** `AddModel()` returns `IResourceBuilder<OllamaModelResource>`, not the Ollama container itself. If you chain `.AddModel()` and assign the result to `ollama`, then `WithReference(ollama)` injects the wrong connection string key (`ConnectionStrings:llama3.2` instead of `ConnectionStrings:ollama`) and the API service fails to start. Keep the container reference in `ollama` and call `AddModel` separately.
+
 ### 3b. Add the client package to the API
 
 ```bash
 cd ../WeatherApp.ApiService
-dotnet add package Aspire.Ollama.ApiClient
+dotnet add package CommunityToolkit.Aspire.OllamaSharp --prerelease
 ```
 
 Register in `Program.cs` after `builder.AddServiceDefaults();`:
 ```csharp
-builder.AddOllamaApiClient("ollama");
+builder.AddOllamaApiClient("ollama", settings => settings.SelectedModel = "llama3.2")
+       .AddChatClient();
 ```
 
-This injects `IChatClient` — the provider-agnostic AI abstraction from `Microsoft.Extensions.AI`.
+This registers `IChatClient` from `Microsoft.Extensions.AI` in the DI container via a two-step fluent call:
+- `AddOllamaApiClient` — connects to the Ollama resource, registers the raw `OllamaApiClient`, and sets `llama3.2` as the default model
+- `.AddChatClient()` — wraps it as an `IChatClient` with built-in OpenTelemetry tracing
+
+> **`SelectedModel` is required.** Without it the `IChatClient` has no model to call and every request throws, causing the fallback summary to show instead of an AI response.
+
+The `IChatClient` abstraction means you can swap Ollama for any other AI provider (Azure OpenAI, OpenAI, etc.) later with a single line change in `Program.cs`.
+
+Add the using at the top of `Program.cs`:
+```csharp
+using Microsoft.Extensions.AI;
+```
 
 ### 3c. Add the `/weathersummary` endpoint
 
+Inject `IChatClient` directly into the endpoint — Aspire wires it up automatically from the `ollama` resource reference:
+
 ```csharp
-app.MapGet("/weathersummary", async (NpgsqlDataSource db, IChatClient ai) =>
+app.MapGet("/weathersummary", async (NpgsqlDataSource db, IChatClient chatClient) =>
 {
     await using var conn = await db.OpenConnectionAsync();
-    var records = await conn.QueryAsync<dynamic>(
-        "SELECT date, temp_c, summary FROM weather_records ORDER BY created_at DESC LIMIT 5");
+    var records = (await conn.QueryAsync<dynamic>(
+        "SELECT date, temp_c, summary FROM weather_records ORDER BY created_at DESC LIMIT 5")).ToList();
 
-    if (!records.Any())
-        return Results.Ok("No weather data yet — visit /weatherforecast first!");
+    if (records.Count == 0)
+        return Results.Ok("No weather data yet - visit /weatherforecast first!");
 
     var forecast = string.Join(", ", records.Select(r =>
         $"{r.date}: {r.temp_c}°C {r.summary}"));
 
-    var response = await ai.GetResponseAsync(
-        $"You are a friendly weather assistant. In one casual sentence, summarize this " +
-        $"forecast and suggest what to wear: {forecast}");
+    try
+    {
+        var response = await chatClient.GetResponseAsync(
+            $"You are a friendly weather assistant. In one casual sentence, summarize this " +
+            $"forecast and suggest what to wear: {forecast}");
 
-    return Results.Ok(response.Text);
+        return Results.Ok(response.Text);
+    }
+    catch
+    {
+        return Results.Ok($"Recent weather: {forecast}. (AI unavailable - showing fallback summary.)");
+    }
 });
 ```
 
@@ -209,14 +247,13 @@ public async Task<string> GetSummaryAsync(CancellationToken cancellationToken = 
 }
 ```
 
-**Update `WeatherApp.Web/Components/Pages/Weather.razor`** — add the summary display below the forecast table and wire it up in `OnInitializedAsync`:
+**Update `WeatherApp.Web/Components/Pages/Weather.razor`** — show the summary panel in the existing `else` block and wire it up in `OnInitializedAsync`:
 
 ```razor
-@* Add below the closing </table> tag: *@
-@if (summary is not null)
+if (summary is not null)
 {
     <div class="alert alert-info mt-3">
-        <strong>🤖 AI Summary:</strong> @summary
+        <strong>AI Summary:</strong> @summary
     </div>
 }
 
@@ -243,14 +280,14 @@ aspire run
 
 1. Dashboard → **Resources** — you now see an `ollama` container (model download happens on first run — takes a minute)
 2. Load the weather page several times to populate the DB
-3. Click the "AI Summary" button — the LLM reads your real DB history and responds
+3. Refresh the weather page — the summary panel should render (AI response when available, fallback summary otherwise)
 4. Dashboard → **Traces** — expand a `/weathersummary` trace:
    - Span: HTTP call to API
    - Span: Npgsql query
    - Span: **LLM call to Ollama** — latency, token count, model name
 5. Dashboard → **Metrics** — observe LLM request durations
 
-✅ Full observability for AI — out of the box, zero configuration.
+✅ You now have an end-to-end running lab with database persistence and a weather summary endpoint that does not crash when AI is unavailable.
 
 ---
 
@@ -259,9 +296,9 @@ aspire run
 You have:
 - Added PostgreSQL with **zero connection string config** — Aspire injects it automatically
 - Persisted data with **Dapper** — plain SQL, no migration tooling
-- Added a **local LLM** (Ollama) that runs entirely in a container — no API key, no internet
-- Built an AI feature that reads real DB data and generates natural language summaries
-- Observed **LLM traces** in the Aspire dashboard alongside your HTTP and DB spans
+- Added a **local LLM container** (Ollama) managed by AppHost
+- Used `IChatClient` from `Microsoft.Extensions.AI` — a provider-agnostic abstraction
+- Built a weather summary feature that reads real DB data and returns either AI text or a safe fallback summary
 
 ---
 
@@ -283,7 +320,7 @@ What does the weathersummary trace look like?
 
 Copilot can now see your live resources, logs, and traces directly.
 
-### Bonus 2 – Swap Ollama for Azure OpenAI (zero code change)
+### Bonus 2 – Swap Ollama for Azure OpenAI (advanced)
 
 ```csharp
 // AppHost.cs — replace the ollama lines with:
@@ -295,7 +332,7 @@ var apiService = builder.AddProject<...>("apiservice")
     .WaitFor(apiService);
 ```
 
-No changes to `Program.cs` or the endpoint — `IChatClient` abstracts the provider.
+Depending on package versions, you may need to update API-side client registration as well.
 
 ### Bonus 3 – History Endpoint
 
@@ -372,7 +409,9 @@ Every push to `main` now builds, tests, and deploys your Aspire app to Azure.
 
 ## Resources
 
-- [Aspire – Ollama integration](https://aspire.dev/integrations/ollama)
+- [Aspire – Ollama get started](https://aspire.dev/integrations/ai/ollama/ollama-get-started/)
+- [Aspire – Ollama host integration](https://aspire.dev/integrations/ai/ollama/ollama-host/)
+- [Aspire – Ollama client integration](https://aspire.dev/integrations/ai/ollama/ollama-client/)
 - [Microsoft.Extensions.AI overview](https://learn.microsoft.com/dotnet/ai/ai-extensions)
 - [Aspire – Integrations overview](https://aspire.dev/integrations/)
 - [Aspire – App Host](https://aspire.dev/get-started/app-host/)
